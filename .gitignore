@@ -1,0 +1,15 @@
+# Ignore everything
+*
+
+# Allow directories
+!*/
+
+# Allow source code / notes
+!*.c
+!*.h
+!*.md
+!Makefile
+!.gitignore
+
+# But ignore kernel-generated C files
+*.mod.c
