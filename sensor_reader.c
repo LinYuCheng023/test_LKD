@@ -50,8 +50,18 @@ int main(int argc, char *argv[])
 
 	if (argc >= 2)
 		want = strtol(argv[1], NULL, 10);
+	
+	struct sigaction sa = {0};
+	sa.sa_handler = on_sigint;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
 
-	signal(SIGINT, on_sigint);   /* 讓 Ctrl-C 能優雅結束 */
+	if (sigaction(SIGINT, &sa, NULL) < 0) {
+		fprintf(stderr, "sigaction 失敗: %s\n", strerror(errno));
+		return 1;
+	}
+
+	// signal(SIGINT, on_sigint);   /* 讓 Ctrl-C 能優雅結束 */
 
 	fd = open(DEV_PATH, O_RDONLY);
 	if (fd < 0) {

@@ -40,6 +40,10 @@
 #define SAMPLE_PERIOD_MS   100        /* 採樣週期 100ms（>板子 10ms 精度，安全）*/
 #define FIFO_SIZE          64         /* kfifo 容量（筆數，必須 2 的冪）*/
 #define DEV_NAME           "sensor_sample"
+#define FAIL_TEST 		   1
+
+static int fail_step = 0;
+module_param(fail_step, int, 0644);
 
 /* 一筆採樣資料 */
 struct sample_data {
@@ -234,6 +238,7 @@ static long sensor_ioctl(struct file *filp, unsigned int cmd,
 	struct sensor_stats stats;
 	u32 period_ms;
 	ktime_t period;
+	bool need_start = false;
 	unsigned long flags;
 	
 	if(READ_ONCE(dev->dying))
@@ -292,11 +297,18 @@ static long sensor_ioctl(struct file *filp, unsigned int cmd,
 			}
 			
 			spin_lock_irqsave(&dev->state_lock, flags);
-			dev->running = true;
-			stats.running = true;
-			period = dev->period;
+			if (!dev->running) {
+				dev->running = true;
+				period = dev->period;
+				need_start = true;
+			}
+			stats.running = dev->running;
 			spin_unlock_irqrestore(&dev->state_lock, flags);
-			hrtimer_start(&dev->sample_timer, period, HRTIMER_MODE_REL);
+
+			if (need_start) {
+				hrtimer_start(&dev->sample_timer, period, HRTIMER_MODE_REL);
+			}
+
 			mutex_unlock(&dev->control_lock);
 			
 			if (copy_to_user((void __user *)arg, &stats.running, sizeof(stats.running)))
@@ -347,6 +359,48 @@ static __poll_t sensor_poll(struct file *filp, poll_table *wait)
 	return mask;
 }
 
+static ssize_t period_ms_show(struct device *device, 
+							  struct device_attribute *attr, 
+							  char *buf)
+{
+	struct sensor_dev *dev = dev_get_drvdata(device);
+	unsigned long flags;;
+	u32 period_ms;
+
+	spin_lock_irqsave(&dev->state_lock, flags);
+	period_ms = dev->period_ms;
+	spin_unlock_irqrestore(&dev->state_lock, flags);
+
+	return sysfs_emit(buf, "%u\n", period_ms);
+}
+
+static ssize_t period_ms_store(struct device *device, 
+	                           struct device_attribute *atte, 
+							   const char *buf,
+							   size_t count)
+{
+	struct sensor_dev *dev = dev_get_drvdata(device);
+	unsigned long flags;
+	u32 period_ms;
+	int ret;
+
+	ret = kstrtou32(buf, 10, &period_ms);
+	if (ret)
+		return ret;
+
+	if (period_ms < 10 || period_ms > 60000)
+		return -EINVAL;
+
+	spin_lock_irqsave(&dev->state_lock, flags);
+	dev->period_ms = period_ms;
+	dev->period = ms_to_ktime(period_ms);
+	spin_unlock_irqrestore(&dev->state_lock, flags);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(period_ms);
+
 static const struct file_operations sensor_fops = {
 	.owner   = THIS_MODULE,
 	.open    = sensor_open,
@@ -382,19 +436,47 @@ static int sensor_probe(struct platform_device *pdev)
 
 	/* 建立這顆 device 的 FIFO */
 	ret = kfifo_alloc(&dev->fifo, FIFO_SIZE, GFP_KERNEL);
+
 	if (ret) { pr_err("%s: kfifo_alloc failed\n", DEV_NAME); goto err_free; }
+#if FAIL_TEST
+	if (fail_step == 1) { ret = -EIO; goto err_fifo; }
+#endif
 
 	/* CH13 字元設備註冊 */
 	ret = alloc_chrdev_region(&dev->devt, 0, 1, DEV_NAME);
+
 	if (ret) goto err_fifo;
+#if FAIL_TEST
+	if (fail_step == 2) { ret = -EIO; goto err_region; }
+#endif
 	cdev_init(&dev->cdev, &sensor_fops);
 	dev->cdev.owner = THIS_MODULE;
 	ret = cdev_add(&dev->cdev, dev->devt, 1);
 	if (ret) goto err_region;
+#if FAIL_TEST
+	if (fail_step == 3) { ret = -EIO; goto err_region; }
+#endif
+
 	dev->class = class_create(DEV_NAME);   /* 5.10：只收 name */
+	
 	if (IS_ERR(dev->class)) { ret = PTR_ERR(dev->class); goto err_cdev; }
+#if FAIL_TEST
+	if (fail_step == 4) { ret = -EIO; goto err_class; }
+#endif
+
 	dev->device = device_create(dev->class, NULL, dev->devt, NULL, DEV_NAME);
+
 	if (IS_ERR(dev->device)) { ret = PTR_ERR(dev->device); goto err_class; }
+#if FAIL_TEST
+	if (fail_step == 5) { ret = -EIO; goto err_dev; }
+#endif
+
+	dev_set_drvdata(dev->device, dev);
+	ret = device_create_file(dev->device, &dev_attr_period_ms);
+	if (ret) {
+		pr_err("%s: device_create_file failed\n", DEV_NAME);
+		goto err_dev;
+	}
 
 	/* 建立這顆 device 的 timer */
 	dev->period_ms = SAMPLE_PERIOD_MS;
@@ -410,6 +492,9 @@ static int sensor_probe(struct platform_device *pdev)
 		DEV_NAME, DEV_NAME, SAMPLE_PERIOD_MS);
 	return 0;
 
+#if FAIL_TEST
+err_dev:    device_destroy(dev->class, dev->devt);
+#endif
 err_class:  class_destroy(dev->class);
 err_cdev:   cdev_del(&dev->cdev);
 err_region: unregister_chrdev_region(dev->devt, 1);
@@ -424,6 +509,9 @@ static void sensor_remove(struct platform_device *pdev)
 	struct sensor_dev *dev;
 	
 	dev = platform_get_drvdata(pdev);
+
+	if (!dev)
+        return;
 	
 	/* 清理順序（反向拆解）：*/
 	mutex_lock(&dev->control_lock);
@@ -441,6 +529,7 @@ static void sensor_remove(struct platform_device *pdev)
     
 	wake_up_interruptible(&dev->read_wq);
 
+	device_remove_file(dev->device, &dev_attr_period_ms);
 	device_destroy(dev->class, dev->devt);/* 4. 拆字元設備 */
 	class_destroy(dev->class);
 	cdev_del(&dev->cdev);
