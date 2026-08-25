@@ -366,7 +366,7 @@ static ssize_t period_ms_show(struct device *device,
 							  char *buf)
 {
 	struct sensor_dev *dev = dev_get_drvdata(device);
-	unsigned long flags;;
+	unsigned long flags;
 	u32 period_ms;
 
 	spin_lock_irqsave(&dev->state_lock, flags);
@@ -376,8 +376,33 @@ static ssize_t period_ms_show(struct device *device,
 	return sysfs_emit(buf, "%u\n", period_ms);
 }
 
+static ssize_t stats_show(struct device * device,
+						  struct device_attribute *attr,
+						  char *buf)
+{
+	struct sensor_dev *dev = dev_get_drvdata(device);
+	unsigned long flags;
+	struct sensor_stats stats;	
+
+	memset(&stats, 0 ,sizeof(stats));
+
+	stats.sample_count = atomic_read(&dev->sample_count);
+	stats.drop_count = atomic_read(&dev->drop_count);
+	spin_lock_irqsave(&dev->fifo_lock, flags);
+	stats.fifo_len = kfifo_len(&dev->fifo);
+	spin_unlock_irqrestore(&dev->fifo_lock, flags);
+	
+	spin_lock_irqsave(&dev->state_lock, flags);
+	stats.period_ms = dev->period_ms;
+	stats.running = dev->running;
+	spin_unlock_irqrestore(&dev->state_lock, flags);
+
+	return sysfs_emit(buf, "sample_count=%u drop_count=%u fifo_len=%u period_ms=%u running=%u\n",
+		stats.sample_count, stats.drop_count, stats.fifo_len, stats.period_ms, stats.running);
+}
+
 static ssize_t period_ms_store(struct device *device, 
-	                           struct device_attribute *atte, 
+	                           struct device_attribute *attr,
 							   const char *buf,
 							   size_t count)
 {
@@ -402,6 +427,7 @@ static ssize_t period_ms_store(struct device *device,
 }
 
 static DEVICE_ATTR_RW(period_ms);
+static DEVICE_ATTR_RO(stats);
 
 static const struct file_operations sensor_fops = {
 	.owner   = THIS_MODULE,
@@ -480,15 +506,28 @@ static int sensor_probe(struct platform_device *pdev)
 		pr_err("%s: device_create_file failed\n", DEV_NAME);
 		goto err_dev;
 	}
+	
+	ret = device_create_file(dev->device, &dev_attr_stats);
+	if (ret) {
+		pr_err("%s: device_create_file failed\n", DEV_NAME);
+		goto err_dev_attr_period_ms;
+	}
+	
+	if (device_property_present(&pdev->dev, "sample-period-ms")) {
+		ret = device_property_read_u32(&pdev->dev, "sample-period-ms", &period_ms);
 
-	/* 建立這顆 device 的 timer */
-	device_property_read_u32(&pdev->dev, "sample-period-ms", &period_ms);
-
+		if (ret) {
+			dev_err(&pdev->dev, "invalid sample-period-ms: %d\n", ret);
+			goto err_dev_attr_stats;
+		}
+	}
+	
 	if (period_ms < 10 || period_ms > 60000) {
 		ret =  -EINVAL;
-		goto err_dev;
+		goto err_dev_attr_stats;
 	}
 
+	/* 建立這顆 device 的 timer */
 	dev->period_ms = period_ms;
 	dev->period = ms_to_ktime(period_ms);
 	hrtimer_setup(&dev->sample_timer, sample_timer_cb, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -499,17 +538,25 @@ static int sensor_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, dev);
 
 	pr_info("%s: loaded. /dev/%s ready, sampling @ %dms\n",
-		DEV_NAME, DEV_NAME, SAMPLE_PERIOD_MS);
+		DEV_NAME, DEV_NAME, period_ms);
 	return 0;
 
-#if FAIL_TEST
-err_dev:    device_destroy(dev->class, dev->devt);
-#endif
-err_class:  class_destroy(dev->class);
-err_cdev:   cdev_del(&dev->cdev);
-err_region: unregister_chrdev_region(dev->devt, 1);
-err_fifo:   kfifo_free(&dev->fifo);
-err_free:   kfree(dev);
+err_dev_attr_stats:
+	device_remove_file(dev->device, &dev_attr_stats);
+err_dev_attr_period_ms:
+	device_remove_file(dev->device, &dev_attr_period_ms);
+err_dev:    
+	device_destroy(dev->class, dev->devt);
+err_class: 
+	class_destroy(dev->class);
+err_cdev:   
+	cdev_del(&dev->cdev);
+err_region:
+	unregister_chrdev_region(dev->devt, 1);
+err_fifo:   
+	kfifo_free(&dev->fifo);
+err_free:   
+	kfree(dev);
 	return ret;
 }
 
@@ -522,6 +569,8 @@ static void sensor_remove(struct platform_device *pdev)
 
 	if (!dev)
         return;
+	
+	platform_set_drvdata(pdev, NULL);
 	
 	/* 清理順序（反向拆解）：*/
 	mutex_lock(&dev->control_lock);
@@ -539,6 +588,7 @@ static void sensor_remove(struct platform_device *pdev)
     
 	wake_up_interruptible(&dev->read_wq);
 
+	device_remove_file(dev->device, &dev_attr_stats);
 	device_remove_file(dev->device, &dev_attr_period_ms);
 	device_destroy(dev->class, dev->devt);/* 4. 拆字元設備 */
 	class_destroy(dev->class);
