@@ -35,6 +35,9 @@
 #include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/kref.h>
+#include <linux/of.h>
+#include <linux/mod_devicetable.h>
+#include <linux/property.h>
 #include "sensor_ioctl.h"
 
 #define SAMPLE_PERIOD_MS   100        /* 採樣週期 100ms（>板子 10ms 精度，安全）*/
@@ -79,7 +82,6 @@ struct sensor_dev {
 	struct kref 		ref;
 };
 
-static struct platform_device *sensor_pdev;
 
 /* 模擬讀傳感器（真實是 i2c/spi，會睡）*/
 static u32 fake_read_sensor(void)
@@ -415,6 +417,7 @@ static int sensor_probe(struct platform_device *pdev)
 	pr_info("sensor_probe!!");
 	struct sensor_dev *dev;
 	int ret;
+	u32 period_ms = SAMPLE_PERIOD_MS;
 	
 	/* 建立「這顆 device」的 private data */
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -479,8 +482,15 @@ static int sensor_probe(struct platform_device *pdev)
 	}
 
 	/* 建立這顆 device 的 timer */
-	dev->period_ms = SAMPLE_PERIOD_MS;
-	dev->period = ms_to_ktime(dev->period_ms);
+	device_property_read_u32(&pdev->dev, "sample-period-ms", &period_ms);
+
+	if (period_ms < 10 || period_ms > 60000) {
+		ret =  -EINVAL;
+		goto err_dev;
+	}
+
+	dev->period_ms = period_ms;
+	dev->period = ms_to_ktime(period_ms);
 	hrtimer_setup(&dev->sample_timer, sample_timer_cb, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	dev->running = true;
 	hrtimer_start(&dev->sample_timer, dev->period, HRTIMER_MODE_REL);
@@ -542,6 +552,12 @@ static void sensor_remove(struct platform_device *pdev)
 	kref_put(&dev->ref, sensor_dev_free);
 }
 
+static const struct of_device_id sensor_of_match[] = {
+	{ .compatible = "ian,sensor-sample" },
+	{ }
+};
+
+MODULE_DEVICE_TABLE(of, sensor_of_match);
 
 static struct platform_driver sensor_driver = {
 	.probe = sensor_probe,
@@ -549,29 +565,18 @@ static struct platform_driver sensor_driver = {
 	
 	.driver = {
 		.name = DEV_NAME,
+		.of_match_table = sensor_of_match,
 	},
 };
+
 static int __init sensor_init(void)
 {
-	int ret;
-	sensor_pdev = platform_device_register_simple(DEV_NAME, -1, NULL, 0);
-	
-	if (IS_ERR(sensor_pdev))
-		return PTR_ERR(sensor_pdev);
-	
-	ret = platform_driver_register(&sensor_driver);
-	if (ret) {
-		platform_device_unregister(sensor_pdev);
-		return ret;
-	}
-	
-	return 0;
+	return platform_driver_register(&sensor_driver);
 }
 
 static void __exit sensor_exit(void)
 {
 	platform_driver_unregister(&sensor_driver);
-	platform_device_unregister(sensor_pdev);
 }
 
 module_init(sensor_init);
