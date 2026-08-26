@@ -31,7 +31,7 @@ obj-m += tear_crash.o
 
 
 # 使用者空間測試程式清單
-USER_PROGS := test_ioctl test_mmap test_lazy test_null test_tlb test_dma test_container sensor_reader sensor_poll_reader sensor_ioctl
+USER_PROGS := test_ioctl test_mmap test_lazy test_null test_tlb test_dma test_container sensor_reader sensor_poll_reader sensor_ioctl sensor_sigio
 
 ccflags-y += -g
 #ccflags-y += -Werror

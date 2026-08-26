@@ -68,6 +68,7 @@ struct sensor_dev {
 	struct mutex	    control_lock;    /*讓 START/STOP 不會同時操作timer/work*/
 
 	wait_queue_head_t   read_wq;         /* CH11 read 阻塞用 */
+	struct fasync_struct *async_queue;
 	bool                dying;           /* 卸載中：讓睡在 read 的進程醒來退出 */
 
 	atomic_t            sample_count;    /* CH10 總採樣數 */
@@ -128,6 +129,8 @@ static void sample_work_fn(struct work_struct *w)
 		pr_warn_ratelimited("%s: fifo full, drop seq=%u\n", DEV_NAME, data.seq);
 	 } else {
 		 wake_up_interruptible(&dev->read_wq);
+
+		 kill_fasync(&dev->async_queue, SIGIO, POLL_IN);
 	 }
 	 
 }
@@ -194,15 +197,15 @@ static ssize_t sensor_read(struct file *filp, char __user *buf,
 		 
 		if(n == 1)
 			 break;
+		
+		if(READ_ONCE(dev->dying))
+			return -ENODEV;
 		 
 		if(filp->f_flags & O_NONBLOCK)
 			return -EAGAIN;
 		
 		if(wait_event_interruptible(dev->read_wq, sensor_fifo_has_data(dev) || READ_ONCE(dev->dying)))
 			return -ERESTARTSYS;
-		
-		if(READ_ONCE(dev->dying))
-			return -ENODEV;
 
 	}
 
@@ -228,9 +231,18 @@ static int sensor_open(struct inode *inode, struct file *filp)
 static int sensor_release(struct inode *inode, struct file *filp) 
 { 
 	struct sensor_dev *dev = filp->private_data;
+
+	fasync_helper(-1, filp, 0, &dev->async_queue);
 	
 	kref_put(&dev->ref, sensor_dev_free);
 	return 0; 
+}
+
+static int sensor_fasync(int fd, struct file *filp, int on)
+{
+	struct sensor_dev *dev = filp->private_data;
+
+	return fasync_helper(fd, filp, on, &dev->async_queue);
 }
 
 static long sensor_ioctl(struct file *filp, unsigned int cmd,
@@ -436,6 +448,7 @@ static const struct file_operations sensor_fops = {
 	.read    = sensor_read,
 	.unlocked_ioctl = sensor_ioctl,
 	.poll    = sensor_poll,
+	.fasync  = sensor_fasync,
 };
 
 static int sensor_probe(struct platform_device *pdev)
@@ -587,6 +600,8 @@ static void sensor_remove(struct platform_device *pdev)
 	mutex_unlock(&dev->control_lock);
     
 	wake_up_interruptible(&dev->read_wq);
+
+	kill_fasync(&dev->async_queue, SIGIO, POLL_HUP);
 
 	device_remove_file(dev->device, &dev_attr_stats);
 	device_remove_file(dev->device, &dev_attr_period_ms);
